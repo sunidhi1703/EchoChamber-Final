@@ -47,4 +47,6 @@ Reduced loss from 0.7 to 0.5
 ### 3.  Tokenization Update
 - Added `"human:"` and `"bot:"` labels to each training sample.
 ```python
-formatted_text = f"human: {prompt}\nbot: {response}"
+input_text = "human: " + example["input"] + "\n"
+output_text = "bot: " + example["output"] + tokenizer.eos_token
+full_text = input_text + output_text
