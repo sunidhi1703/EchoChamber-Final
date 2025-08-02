@@ -1,0 +1,190 @@
+
+
+# Step 1: Parse movie_lines.txt
+from google.colab import files
+uploaded = files.upload()
+id2line = {}
+with open("movie_lines.txt", encoding="ISO-8859-1") as f:  # You can try changing this and see what changes in the response you get :)
+    for line in f:
+        parts = line.strip().split(" +++$+++ ")
+        if len(parts) == 5:
+            line_id = parts[0]
+            text = parts[4]
+            id2line[line_id] = text
+
+# Step 2: Parse movie_conversations.txt into a list of conversations
+conversations = []
+with open("movie_conversations.txt", encoding="ISO-8859-1") as f:  # Make sure to keet encodings consistent
+    for line in f:
+        parts = line.strip().split(" +++$+++ ")
+        if len(parts) == 4:
+            try:
+                utterance_ids = eval(parts[3])  # Converts string list to actual list
+                conversations.append(utterance_ids)
+            except Exception as e:
+                print(f"Skipping line due to eval error: {e}")
+
+# Step 3: Build input-output pairs (prompt-response)
+pairs = []
+for conv in conversations:
+    for i in range(len(conv) - 1):
+        if conv[i] in id2line and conv[i+1] in id2line:
+            input_line = id2line[conv[i]].strip()
+            target_line = id2line[conv[i+1]].strip()
+            if input_line and target_line:  # skip empty lines
+                pairs.append((input_line, target_line))
+
+
+print(f"Loaded {len(pairs)} dialog pairs.")
+
+
+import random
+
+# Parameters
+SAMPLE_SIZE = 10_000      # increased to 10000 for better training
+RANDOM_SEED = 42          # set this if you need deterministic sampling
+
+# Draw the sample
+random.seed(RANDOM_SEED)          # comment this out for a fresh shuffle each run
+sample_pairs = random.sample(pairs, SAMPLE_SIZE)
+
+print(f"Sampled {len(sample_pairs)} pairs.")
+
+from datasets import Dataset
+
+# Create a Hugging Face Dataset from your list of (input, output) pairs
+data = [{"input": q, "output": a} for q, a in sample_pairs]
+hf_dataset = Dataset.from_list(data)
+
+print(hf_dataset[0])  # sanity check
+
+
+# If not installed, uncomment the code and install
+# !pip install transformers
+
+
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-small")
+tokenizer.pad_token = tokenizer.eos_token  # Fix the pad token issue
+
+
+def tokenize(example):
+    # added tokens so that bot understands when its the bots turn to respond
+    input_text = "human: " + example["input"] + "\n"
+    output_text = "bot: " + example["output"] + tokenizer.eos_token #added tokens 
+    full_text = input_text+output_text
+    tokens = tokenizer(full_text, truncation=True, padding="max_length", max_length=128)
+    tokens["labels"] = tokens["input_ids"].copy()  # Causal language modeling
+    return tokens
+
+tokenized_dataset = hf_dataset.map(tokenize, batched=False)
+
+
+# If error persists, uncomment this code, execute it and run below snippet again
+# !pip install -U transformers
+
+
+import os
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+)
+# Need to import get_last_checkpoint from the trainer_utils module
+from transformers.trainer_utils import get_last_checkpoint
+
+
+# 1. Detect an existing checkpoint (if any)
+
+output_dir = "./dialogpt-finetuned"
+last_ckpt  = get_last_checkpoint(output_dir) if os.path.isdir(output_dir) else None
+if last_ckpt:
+    print(f"  Found checkpoint at: {last_ckpt} – resuming from there.")
+
+
+# 2. Load model (fresh or from checkpoint)
+
+model_name_or_path = last_ckpt or "microsoft/DialoGPT-medium"
+model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+
+# (Optional but tidy) – make sure pad token is set
+
+tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
+tokenizer.pad_token = tokenizer.eos_token
+
+
+training_args = TrainingArguments(
+    output_dir           = output_dir,
+    per_device_train_batch_size = 4,
+    num_train_epochs     = 3,
+    dataloader_num_workers = 4,
+
+    # logging & checkpointing
+    logging_strategy     = "steps",
+    logging_steps        = 200,
+    save_strategy        = "steps",
+    save_steps           = 500,
+    save_total_limit     = 2,
+
+    # misc
+    fp16                 = True,     # comment out if GPU doesn’t support fp16
+    report_to            = "none",   # no WandB/HF Hub logging
+)
+
+
+# 4. Trainer
+trainer = Trainer(
+    model         = model,
+    args          = training_args,
+    train_dataset = tokenized_dataset,
+    tokenizer     = tokenizer,  # keeps pad/eos alignment neat
+)
+
+
+# 5. Train – resume if we have a checkpoint
+trainer.train(resume_from_checkpoint=last_ckpt)
+
+# Saving the freshly trained moel and its tokeniser
+trainer.save_model("./dialogpt-finetuned/final")
+tokenizer.save_pretrained("./dialogpt-finetuned/final")
+
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+# Load the fine-tuned model
+model_path = "./dialogpt-finetuned/final"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model     = AutoModelForCausalLM.from_pretrained(model_path)
+model.eval()
+
+# Chat prompt
+chat_history = []
+while True:
+    user_input = input("You: ")
+    if user_input.lower() in ["exit", "quit"]: break
+
+    new_input_ids = tokenizer.encode(user_input + tokenizer.eos_token, return_tensors='pt')
+    bot_input_ids = torch.cat(chat_history + [new_input_ids], dim=-1) if chat_history else new_input_ids
+
+    output_ids = model.generate(
+        bot_input_ids,
+        max_length=1000,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=True,
+        top_k=50,
+        top_p=0.95,
+        temperature=0.9,
+    )
+
+    response = tokenizer.decode(output_ids[:, bot_input_ids.shape[-1]:][0], skip_special_tokens=True)
+    print(f"Bot: {response}")
+    chat_history.append(new_input_ids)
+
+
+
+
+
+
